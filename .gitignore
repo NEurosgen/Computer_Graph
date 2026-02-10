@@ -1,8 +1,7 @@
 x64/
-.vs/
-WindowsProject1.slnx
+.vs
 *.user
 *.ico
 *.h
-*.vcxproj*
+
 
