@@ -1,7 +1,11 @@
+
+.vs/
+[Dd]ebug/
+[Rr]elease/
 x64/
-.vs
-*.user
-*.ico
-*.h
+x86/
 
-
+*.exe
+*.pdb
+*.obj
+*.log
