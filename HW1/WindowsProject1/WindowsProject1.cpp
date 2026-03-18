@@ -357,7 +357,27 @@ void GenerateSphere(int latLines, int longLines, std::vector<SkyboxVertex>& vert
         indices.push_back(baseIndex + i + 1);
     }
 }
+std::wstring GetExeDirectory() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring wsPath(path);
+    size_t pos = wsPath.find_last_of(L"\\/");
+    return (std::wstring::npos == pos) ? L"" : wsPath.substr(0, pos + 1);
+}
+std::wstring GetAssetPath(const std::wstring& filename) {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring path(exePath);
 
+    size_t lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) path = path.substr(0, lastSlash);
+    lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) path = path.substr(0, lastSlash);
+    lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) path = path.substr(0, lastSlash);
+
+    return path + L"\\Assets\\" + filename;
+}
 HRESULT InitScene() {
     HRESULT hr = S_OK;
 
@@ -453,25 +473,32 @@ HRESULT InitScene() {
     rastDesc.CullMode = D3D11_CULL_NONE;
     m_pDevice->CreateRasterizerState(&rastDesc, &m_pRasterizerStateSkybox);
 
-    // --- Загрузка текстуры куба ---
+
+
     TextureDesc cubeDesc;
-    if (LoadDDS(L"vect.dds", cubeDesc, false)) {
+    std::wstring cubePath = GetAssetPath(L"vect.dds");
+    if (LoadDDS(cubePath.c_str(), cubeDesc, false)) {
         CreateTextureSRV(m_pDevice, cubeDesc, false, &m_pCubeTextureView);
         delete[] static_cast<char*>(cubeDesc.pData);
     }
     else {
-        OutputDebugStringA("Failed to load vect.dds\n");
+        std::wstring errorMsg = L"Failed to load: " + cubePath;
+        MessageBoxW(nullptr, errorMsg.c_str(), L"Resource Error", MB_OK | MB_ICONERROR);
     }
 
-    // --- Загрузка текстуры скайбокса ---
+
+
     TextureDesc skyboxDesc;
-    if (LoadDDS(L"skybox.dds", skyboxDesc, true)) {
+    std::wstring skyboxPath = GetAssetPath(L"skybox.dds");
+    if (LoadDDS(skyboxPath.c_str(), skyboxDesc, true)) {
         CreateTextureSRV(m_pDevice, skyboxDesc, true, &m_pSkyboxView);
         delete[] static_cast<char*>(skyboxDesc.pData);
     }
     else {
-        OutputDebugStringA("Failed to load skybox.dds\n");
+        std::wstring errorMsg = L"Failed to load: " + skyboxPath;
+        MessageBoxW(nullptr, errorMsg.c_str(), L"Resource Error", MB_OK | MB_ICONERROR);
     }
+
 
     return hr;
 }
