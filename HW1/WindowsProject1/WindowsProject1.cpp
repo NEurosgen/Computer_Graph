@@ -21,7 +21,6 @@ using namespace DirectX;
 #define SAFE_RELEASE(p) { if (p) { (p)->Release(); (p) = nullptr; } }
 #define DDS_MAGIC 0x20534444 
 
-
 ID3D11Device* m_pDevice = nullptr;
 ID3D11DeviceContext* m_pDeviceContext = nullptr;
 IDXGISwapChain* m_pSwapChain = nullptr;
@@ -29,13 +28,18 @@ ID3D11RenderTargetView* m_pBackBufferRTV = nullptr;
 ID3D11Texture2D* m_pDepthStencilBuffer = nullptr;
 ID3D11DepthStencilView* m_pDepthStencilView = nullptr;
 
+ID3D11DepthStencilState* m_pDepthStateOpaque = nullptr;
+ID3D11DepthStencilState* m_pDepthStateSkybox = nullptr;
+ID3D11DepthStencilState* m_pDepthStateTransparent = nullptr;
+ID3D11BlendState* m_pBlendStateTransparent = nullptr;
+
 ID3D11Buffer* m_pCubeVB = nullptr;
 ID3D11Buffer* m_pCubeIB = nullptr;
 ID3D11VertexShader* m_pCubeVS = nullptr;
 ID3D11PixelShader* m_pCubePS = nullptr;
+ID3D11PixelShader* m_pTransPS = nullptr; // Новый шейдер для прозрачности
 ID3D11InputLayout* m_pCubeLayout = nullptr;
 ID3D11ShaderResourceView* m_pCubeTextureView = nullptr;
-
 
 ID3D11Buffer* m_pSkyboxVB = nullptr;
 ID3D11Buffer* m_pSkyboxIB = nullptr;
@@ -46,22 +50,18 @@ ID3D11ShaderResourceView* m_pSkyboxView = nullptr;
 UINT m_skyboxIndexCount = 0;
 ID3D11RasterizerState* m_pRasterizerStateSkybox = nullptr;
 
-
 ID3D11Buffer* m_pGeomBuffer = nullptr;
 ID3D11Buffer* m_pSceneBuffer = nullptr;
 ID3D11SamplerState* m_pSampler = nullptr;
-
 
 UINT m_width = 1280;
 UINT m_height = 720;
 ULONGLONG startTime = 0;
 ULONGLONG lastTime = 0;
 
-
-XMVECTOR camPosition = XMVectorSet(0.0f, 1.0f, -3.0f, 0.0f);
-float camYaw = 0.0f;
-float camPitch = 0.0f;
-
+XMVECTOR camPosition = XMVectorSet(4.0f, 3.0f, -5.0f, 0.0f);
+float camYaw = -0.65f;
+float camPitch = 0.45f;
 
 struct TextureVertex {
     float x, y, z;
@@ -74,7 +74,8 @@ struct SkyboxVertex {
 
 struct GeomBuffer {
     XMMATRIX model;
-    XMVECTOR size; 
+    XMVECTOR size;
+    XMVECTOR colorMultiplier;
 };
 
 struct SceneBuffer {
@@ -119,13 +120,9 @@ struct DDS_HEADER {
     uint32_t        dwReserved2;
 };
 
-
 bool LoadDDS(const wchar_t* filename, TextureDesc& desc, bool isCubemap = false) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        OutputDebugStringA("Failed to open DDS file.\n");
-        return false;
-    }
+    if (!file.is_open()) return false;
 
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
@@ -141,8 +138,7 @@ bool LoadDDS(const wchar_t* filename, TextureDesc& desc, bool isCubemap = false)
     desc.height = header.dwHeight;
     desc.mipmapsCount = header.dwMipMapCount == 0 ? 1 : header.dwMipMapCount;
 
-    
-    if (header.ddspf.dwFlags & 0x4) { 
+    if (header.ddspf.dwFlags & 0x4) {
         switch (header.ddspf.dwFourCC) {
         case 0x31545844: desc.fmt = DXGI_FORMAT_BC1_UNORM; break;
         case 0x33545844: desc.fmt = DXGI_FORMAT_BC2_UNORM; break;
@@ -154,7 +150,6 @@ bool LoadDDS(const wchar_t* filename, TextureDesc& desc, bool isCubemap = false)
         desc.fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
 
-
     std::streamsize dataSize = size - sizeof(magic) - sizeof(header);
     desc.pData = new char[dataSize];
     file.read(reinterpret_cast<char*>(desc.pData), dataSize);
@@ -162,7 +157,6 @@ bool LoadDDS(const wchar_t* filename, TextureDesc& desc, bool isCubemap = false)
     return true;
 }
 
-// Конвертация сырых данных в ресурс текстуры DirectX
 HRESULT CreateTextureSRV(ID3D11Device* device, const TextureDesc& desc, bool isCubemap, ID3D11ShaderResourceView** ppSRV) {
     D3D11_TEXTURE2D_DESC texDesc = {};
     texDesc.Width = desc.width;
@@ -183,8 +177,7 @@ HRESULT CreateTextureSRV(ID3D11Device* device, const TextureDesc& desc, bool isC
         for (UINT mip = 0; mip < texDesc.MipLevels; ++mip) {
             UINT mipWidth = std::max(1u, desc.width >> mip);
             UINT mipHeight = std::max(1u, desc.height >> mip);
-            UINT mipPitch = 0;
-            UINT mipLines = 0;
+            UINT mipPitch = 0, mipLines = 0;
 
             if (desc.fmt == DXGI_FORMAT_BC1_UNORM) {
                 mipPitch = std::max(1u, (mipWidth + 3) / 4) * 8;
@@ -202,7 +195,6 @@ HRESULT CreateTextureSRV(ID3D11Device* device, const TextureDesc& desc, bool isC
             UINT index = arraySlice * texDesc.MipLevels + mip;
             initData[index].pSysMem = static_cast<const char*>(desc.pData) + offset;
             initData[index].SysMemPitch = mipPitch;
-            initData[index].SysMemSlicePitch = 0;
 
             offset += static_cast<size_t>(mipPitch) * mipLines;
         }
@@ -228,6 +220,7 @@ const char* ShadersSource = R"(
 cbuffer GeomBuffer : register(b0) {
     float4x4 model;
     float4 size; 
+    float4 colorMultiplier;
 };
 
 cbuffer SceneBuffer : register(b1) {
@@ -257,8 +250,15 @@ VSCubeOutput vs_cube(VSCubeInput vertex) {
     return result;
 }
 
+// Обычный шейдер с текстурой
 float4 ps_cube(VSCubeOutput pixel) : SV_Target0 {
-    return float4(colorTexture.Sample(colorSampler, pixel.uv).xyz, 1.0);
+    float4 texColor = colorTexture.Sample(colorSampler, pixel.uv);
+    return texColor * colorMultiplier;
+}
+
+// Шейдер для полупрозрачных плоскостей без текстуры
+float4 ps_trans(VSCubeOutput pixel) : SV_Target0 {
+    return float4(colorMultiplier.xyz, colorMultiplier.w);
 }
 
 struct VSSkyboxInput {
@@ -274,6 +274,7 @@ VSSkyboxOutput vs_skybox(VSSkyboxInput vertex) {
     VSSkyboxOutput result;
     float3 pos = cameraPos.xyz + vertex.pos * size.x;
     result.pos = mul(vp, float4(pos, 1.0));
+    result.pos.z = 0.0f; // Принудительно 0 для Reversed Depth
     result.localPos = vertex.pos;
     return result;
 }
@@ -296,7 +297,7 @@ HRESULT CreateRenderTarget() {
     depthDesc.Height = m_height;
     depthDesc.MipLevels = 1;
     depthDesc.ArraySize = 1;
-    depthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
     depthDesc.SampleDesc.Count = 1;
     depthDesc.SampleDesc.Quality = 0;
     depthDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -357,13 +358,7 @@ void GenerateSphere(int latLines, int longLines, std::vector<SkyboxVertex>& vert
         indices.push_back(baseIndex + i + 1);
     }
 }
-std::wstring GetExeDirectory() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring wsPath(path);
-    size_t pos = wsPath.find_last_of(L"\\/");
-    return (std::wstring::npos == pos) ? L"" : wsPath.substr(0, pos + 1);
-}
+
 std::wstring GetAssetPath(const std::wstring& filename) {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -378,9 +373,34 @@ std::wstring GetAssetPath(const std::wstring& filename) {
 
     return path + L"\\Assets\\" + filename;
 }
+
 HRESULT InitScene() {
     HRESULT hr = S_OK;
 
+    D3D11_DEPTH_STENCIL_DESC dssDesc = {};
+    dssDesc.DepthEnable = TRUE;
+    dssDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dssDesc.DepthFunc = D3D11_COMPARISON_GREATER;
+    m_pDevice->CreateDepthStencilState(&dssDesc, &m_pDepthStateOpaque);
+
+    dssDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dssDesc.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    m_pDevice->CreateDepthStencilState(&dssDesc, &m_pDepthStateSkybox);
+
+    dssDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dssDesc.DepthFunc = D3D11_COMPARISON_GREATER;
+    m_pDevice->CreateDepthStencilState(&dssDesc, &m_pDepthStateTransparent);
+
+    D3D11_BLEND_DESC bsDesc = {};
+    bsDesc.RenderTarget[0].BlendEnable = TRUE;
+    bsDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bsDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bsDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bsDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bsDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bsDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bsDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    m_pDevice->CreateBlendState(&bsDesc, &m_pBlendStateTransparent);
 
     static const TextureVertex CubeVertices[24] = {
         {-0.5, -0.5,  0.5, 0, 1}, { 0.5, -0.5,  0.5, 1, 1}, { 0.5, -0.5, -0.5, 1, 0}, {-0.5, -0.5, -0.5, 0, 0},
@@ -403,7 +423,6 @@ HRESULT InitScene() {
     D3D11_SUBRESOURCE_DATA ibDataCube = { CubeIndices, 0, 0 };
     m_pDevice->CreateBuffer(&ibDescCube, &ibDataCube, &m_pCubeIB);
 
-    // Геометрия Skybox
     std::vector<SkyboxVertex> sphereVertices;
     std::vector<USHORT> sphereIndices;
     GenerateSphere(20, 20, sphereVertices, sphereIndices);
@@ -417,7 +436,6 @@ HRESULT InitScene() {
     D3D11_SUBRESOURCE_DATA ibDataSky = { sphereIndices.data(), 0, 0 };
     m_pDevice->CreateBuffer(&ibDescSky, &ibDataSky, &m_pSkyboxIB);
 
-    // Константные буферы 
     D3D11_BUFFER_DESC geomDesc = { sizeof(GeomBuffer), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
     m_pDevice->CreateBuffer(&geomDesc, nullptr, &m_pGeomBuffer);
 
@@ -430,7 +448,6 @@ HRESULT InitScene() {
 #endif
     ID3DBlob* pVSBlob = nullptr; ID3DBlob* pPSBlob = nullptr; ID3DBlob* pErrorBlob = nullptr;
 
-    // Cube
     D3DCompile(ShadersSource, strlen(ShadersSource), nullptr, nullptr, nullptr, "vs_cube", "vs_5_0", flags, 0, &pVSBlob, &pErrorBlob);
     m_pDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pCubeVS);
     D3D11_INPUT_ELEMENT_DESC layoutCube[] = {
@@ -444,7 +461,11 @@ HRESULT InitScene() {
     m_pDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pCubePS);
     SAFE_RELEASE(pPSBlob);
 
-    // Skybox
+    // Компилируем шейдер для полупрозрачности
+    D3DCompile(ShadersSource, strlen(ShadersSource), nullptr, nullptr, nullptr, "ps_trans", "ps_5_0", flags, 0, &pPSBlob, &pErrorBlob);
+    m_pDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pTransPS);
+    SAFE_RELEASE(pPSBlob);
+
     D3DCompile(ShadersSource, strlen(ShadersSource), nullptr, nullptr, nullptr, "vs_skybox", "vs_5_0", flags, 0, &pVSBlob, &pErrorBlob);
     m_pDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pSkyboxVS);
     D3D11_INPUT_ELEMENT_DESC layoutSky[] = { {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0} };
@@ -455,7 +476,6 @@ HRESULT InitScene() {
     m_pDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pSkyboxPS);
     SAFE_RELEASE(pPSBlob);
 
-    // --- 5. Sampler State ---
     D3D11_SAMPLER_DESC sampDesc = {};
     sampDesc.Filter = D3D11_FILTER_ANISOTROPIC;
     sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
@@ -467,13 +487,10 @@ HRESULT InitScene() {
     sampDesc.MaxLOD = FLT_MAX;
     m_pDevice->CreateSamplerState(&sampDesc, &m_pSampler);
 
-    // Rasterizer для Skybox
     D3D11_RASTERIZER_DESC rastDesc = {};
     rastDesc.FillMode = D3D11_FILL_SOLID;
     rastDesc.CullMode = D3D11_CULL_NONE;
     m_pDevice->CreateRasterizerState(&rastDesc, &m_pRasterizerStateSkybox);
-
-
 
     TextureDesc cubeDesc;
     std::wstring cubePath = GetAssetPath(L"vect.dds");
@@ -481,12 +498,6 @@ HRESULT InitScene() {
         CreateTextureSRV(m_pDevice, cubeDesc, false, &m_pCubeTextureView);
         delete[] static_cast<char*>(cubeDesc.pData);
     }
-    else {
-        std::wstring errorMsg = L"Failed to load: " + cubePath;
-        MessageBoxW(nullptr, errorMsg.c_str(), L"Resource Error", MB_OK | MB_ICONERROR);
-    }
-
-
 
     TextureDesc skyboxDesc;
     std::wstring skyboxPath = GetAssetPath(L"skybox.dds");
@@ -494,11 +505,6 @@ HRESULT InitScene() {
         CreateTextureSRV(m_pDevice, skyboxDesc, true, &m_pSkyboxView);
         delete[] static_cast<char*>(skyboxDesc.pData);
     }
-    else {
-        std::wstring errorMsg = L"Failed to load: " + skyboxPath;
-        MessageBoxW(nullptr, errorMsg.c_str(), L"Resource Error", MB_OK | MB_ICONERROR);
-    }
-
 
     return hr;
 }
@@ -574,9 +580,8 @@ void Render() {
 
     static const FLOAT BackColor[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
     m_pDeviceContext->ClearRenderTargetView(m_pBackBufferRTV, BackColor);
-    m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 0.0f, 0);
 
-    // камеры 
     float speed = 5.0f * deltaTime;
     float rotSpeed = 2.0f * deltaTime;
 
@@ -603,9 +608,9 @@ void Render() {
     float aspectRatio = (float)m_width / (float)m_height;
     float nearPlane = 0.1f;
     float farPlane = 100.0f;
-    XMMATRIX proj = XMMatrixPerspectiveFovLH(fov, aspectRatio, nearPlane, farPlane);
 
-    // Расчет радиуса небесной сферы
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(fov, aspectRatio, farPlane, nearPlane);
+
     float width = tanf(fov / 2.0f) * nearPlane * 2.0f;
     float height = width / aspectRatio;
     float sphereRadius = sqrtf(nearPlane * nearPlane + (width / 2.0f) * (width / 2.0f) + (height / 2.0f) * (height / 2.0f)) * 1.1f;
@@ -621,13 +626,45 @@ void Render() {
     D3D11_VIEWPORT viewport = { 0.0f, 0.0f, (FLOAT)m_width, (FLOAT)m_height, 0.0f, 1.0f };
     m_pDeviceContext->RSSetViewports(1, &viewport);
 
+    // Добавляем привязку для пиксельного шейдера
     ID3D11Buffer* constBuffers[] = { m_pGeomBuffer, m_pSceneBuffer };
     m_pDeviceContext->VSSetConstantBuffers(0, 2, constBuffers);
+    m_pDeviceContext->PSSetConstantBuffers(0, 1, &m_pGeomBuffer);
 
     ID3D11SamplerState* samplers[] = { m_pSampler };
     m_pDeviceContext->PSSetSamplers(0, 1, samplers);
 
-    // Отрисовка Skybox 
+    // --- Шаг 1. Отрисовка непрозрачных объектов ---
+    m_pDeviceContext->OMSetDepthStencilState(m_pDepthStateOpaque, 0);
+    m_pDeviceContext->RSSetState(nullptr);
+    m_pDeviceContext->VSSetShader(m_pCubeVS, nullptr, 0);
+    m_pDeviceContext->PSSetShader(m_pCubePS, nullptr, 0);
+
+    UINT strideCube = sizeof(TextureVertex);
+    UINT offsetCube = 0;
+    m_pDeviceContext->IASetVertexBuffers(0, 1, &m_pCubeVB, &strideCube, &offsetCube);
+    m_pDeviceContext->IASetIndexBuffer(m_pCubeIB, DXGI_FORMAT_R16_UINT, 0);
+    m_pDeviceContext->IASetInputLayout(m_pCubeLayout);
+    m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    ID3D11ShaderResourceView* cubeRes[] = { m_pCubeTextureView };
+    m_pDeviceContext->PSSetShaderResources(0, 1, cubeRes);
+
+    GeomBuffer cubeGeom;
+    cubeGeom.colorMultiplier = XMVectorSet(1.0f, 1.0f, 1.0f, 1.0f);
+
+    // Куб 1
+    cubeGeom.model = XMMatrixRotationY(elapsedSec) * XMMatrixTranslation(-1.5f, 0.0f, 0.0f);
+    m_pDeviceContext->UpdateSubresource(m_pGeomBuffer, 0, nullptr, &cubeGeom, 0, 0);
+    m_pDeviceContext->DrawIndexed(36, 0, 0);
+
+    // Куб 2
+    cubeGeom.model = XMMatrixRotationY(-elapsedSec) * XMMatrixTranslation(1.5f, 0.0f, 0.0f);
+    m_pDeviceContext->UpdateSubresource(m_pGeomBuffer, 0, nullptr, &cubeGeom, 0, 0);
+    m_pDeviceContext->DrawIndexed(36, 0, 0);
+
+    // --- Шаг 2. Отрисовка Скайбокса ---
+    m_pDeviceContext->OMSetDepthStencilState(m_pDepthStateSkybox, 0);
     m_pDeviceContext->RSSetState(m_pRasterizerStateSkybox);
 
     GeomBuffer skyboxGeom;
@@ -640,41 +677,61 @@ void Render() {
 
     m_pDeviceContext->VSSetShader(m_pSkyboxVS, nullptr, 0);
     m_pDeviceContext->PSSetShader(m_pSkyboxPS, nullptr, 0);
-
     m_pDeviceContext->IASetIndexBuffer(m_pSkyboxIB, DXGI_FORMAT_R16_UINT, 0);
     UINT strideSky = sizeof(SkyboxVertex);
     UINT offsetSky = 0;
     m_pDeviceContext->IASetVertexBuffers(0, 1, &m_pSkyboxVB, &strideSky, &offsetSky);
     m_pDeviceContext->IASetInputLayout(m_pSkyboxLayout);
-    m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_pDeviceContext->DrawIndexed(m_skyboxIndexCount, 0, 0);
-
-    // --- Отрисовка Куба ---
+    m_pDeviceContext->OMSetDepthStencilState(m_pDepthStateTransparent, 0);
+    m_pDeviceContext->OMSetBlendState(m_pBlendStateTransparent, nullptr, 0xFFFFFFFF);
     m_pDeviceContext->RSSetState(nullptr);
-    m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
-
-    GeomBuffer cubeGeom;
-    cubeGeom.model = XMMatrixRotationY(elapsedSec) * XMMatrixRotationX(elapsedSec * 0.5f);
-    m_pDeviceContext->UpdateSubresource(m_pGeomBuffer, 0, nullptr, &cubeGeom, 0, 0);
-
-    ID3D11ShaderResourceView* cubeRes[] = { m_pCubeTextureView };
-    m_pDeviceContext->PSSetShaderResources(0, 1, cubeRes);
-
     m_pDeviceContext->VSSetShader(m_pCubeVS, nullptr, 0);
-    m_pDeviceContext->PSSetShader(m_pCubePS, nullptr, 0);
-
-    m_pDeviceContext->IASetIndexBuffer(m_pCubeIB, DXGI_FORMAT_R16_UINT, 0);
-    UINT strideCube = sizeof(TextureVertex);
-    UINT offsetCube = 0;
+    m_pDeviceContext->PSSetShader(m_pTransPS, nullptr, 0);
     m_pDeviceContext->IASetVertexBuffers(0, 1, &m_pCubeVB, &strideCube, &offsetCube);
+    m_pDeviceContext->IASetIndexBuffer(m_pCubeIB, DXGI_FORMAT_R16_UINT, 0);
     m_pDeviceContext->IASetInputLayout(m_pCubeLayout);
-    m_pDeviceContext->DrawIndexed(36, 0, 0);
+
+    struct TransObj {
+        XMVECTOR position;
+        XMVECTOR color;
+        float distanceToCam;
+    };
+
+    std::vector<TransObj> transObjects = {
+        { XMVectorSet(0.0f, 0.0f, -0.3f, 1.0f), XMVectorSet(0.8f, 0.2f, 0.8f, 0.5f), 0.0f }, // Фиолетовая плоскость 
+        { XMVectorSet(0.0f, 0.0f, 0.3f, 1.0f), XMVectorSet(0.8f, 0.8f, 0.2f, 0.5f), 0.0f }  // Желтая плоскость 
+    };
+
+
+    for (auto& obj : transObjects) {
+        XMVECTOR diff = XMVectorSubtract(obj.position, camPosition);
+        obj.distanceToCam = XMVectorGetX(XMVector3LengthSq(diff));
+    }
+    std::sort(transObjects.begin(), transObjects.end(), [](const TransObj& a, const TransObj& b) {
+        return a.distanceToCam > b.distanceToCam;
+        });
+
+    for (const auto& obj : transObjects) {
+        cubeGeom.colorMultiplier = obj.color;
+        cubeGeom.model = XMMatrixScaling(4.0f, 4.0f, 0.01f) * XMMatrixTranslationFromVector(obj.position);
+        m_pDeviceContext->UpdateSubresource(m_pGeomBuffer, 0, nullptr, &cubeGeom, 0, 0);
+        m_pDeviceContext->DrawIndexed(36, 0, 0);
+    }
+
+    m_pDeviceContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 
     m_pSwapChain->Present(1, 0);
 }
 
 void Cleanup() {
     if (m_pDeviceContext) m_pDeviceContext->ClearState();
+
+    SAFE_RELEASE(m_pTransPS);
+    SAFE_RELEASE(m_pDepthStateOpaque);
+    SAFE_RELEASE(m_pDepthStateSkybox);
+    SAFE_RELEASE(m_pDepthStateTransparent);
+    SAFE_RELEASE(m_pBlendStateTransparent);
 
     SAFE_RELEASE(m_pRasterizerStateSkybox);
     SAFE_RELEASE(m_pCubeTextureView);
