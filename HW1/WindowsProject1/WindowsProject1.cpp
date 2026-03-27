@@ -359,19 +359,40 @@ void GenerateSphere(int latLines, int longLines, std::vector<SkyboxVertex>& vert
     }
 }
 
+#include <sys/stat.h>
+
+inline bool FileExists(const std::wstring& name) {
+    struct _stat buffer;
+    return (_wstat(name.c_str(), &buffer) == 0);
+}
+
 std::wstring GetAssetPath(const std::wstring& filename) {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring path(exePath);
+    std::wstring basePath(exePath);
 
-    size_t lastSlash = path.find_last_of(L"\\/");
-    if (lastSlash != std::wstring::npos) path = path.substr(0, lastSlash);
-    lastSlash = path.find_last_of(L"\\/");
-    if (lastSlash != std::wstring::npos) path = path.substr(0, lastSlash);
-    lastSlash = path.find_last_of(L"\\/");
-    if (lastSlash != std::wstring::npos) path = path.substr(0, lastSlash);
+    size_t lastSlash = basePath.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        basePath = basePath.substr(0, lastSlash + 1);
+    }
 
-    return path + L"\\Assets\\" + filename;
+    std::wstring directPath = basePath + L"Assets\\" + filename;
+    if (FileExists(directPath)) {
+        return directPath;
+    }
+
+    std::wstring idePath = basePath;
+    for (int i = 0; i < 2; ++i) {
+        if (!idePath.empty() && (idePath.back() == L'\\' || idePath.back() == L'/')) {
+            idePath.pop_back();
+        }
+        size_t slash = idePath.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            idePath = idePath.substr(0, slash + 1);
+        }
+    }
+
+    return idePath + L"Assets\\" + filename;
 }
 
 HRESULT InitScene() {
