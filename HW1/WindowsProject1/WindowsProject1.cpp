@@ -22,6 +22,7 @@ using namespace DirectX;
 #define SAFE_RELEASE(p) { if (p) { (p)->Release(); (p) = nullptr; } }
 #define DDS_MAGIC 0x20534444 
 
+HWND g_hWnd = nullptr;
 ID3D11Device* m_pDevice = nullptr;
 ID3D11DeviceContext* m_pDeviceContext = nullptr;
 IDXGISwapChain* m_pSwapChain = nullptr;
@@ -60,8 +61,22 @@ ID3D11RasterizerState* m_pRasterizerStateSkybox = nullptr;
 
 ID3D11Buffer* m_pSceneBuffer = nullptr;
 ID3D11Buffer* m_pInstanceBuffer = nullptr;
-ID3D11Buffer* m_pVisibilityBuffer = nullptr;
 ID3D11SamplerState* m_pSampler = nullptr;
+
+ID3D11ComputeShader* m_pCullShader = nullptr;
+ID3D11Buffer* m_pCullParams = nullptr;
+ID3D11Buffer* m_pIndirectArgsSrc = nullptr;
+ID3D11UnorderedAccessView* m_pIndirectArgsUAV = nullptr;
+ID3D11Buffer* m_pIndirectArgs = nullptr;
+
+ID3D11Buffer* m_pVisibilityBuffer = nullptr;
+ID3D11UnorderedAccessView* m_pVisibilityBufferUAV = nullptr;
+ID3D11ShaderResourceView* m_pVisibilityBufferSRV = nullptr;
+
+ID3D11Query* m_queries[10] = { nullptr };
+UINT64 m_curFrame = 0;
+UINT64 m_lastCompletedFrame = 0;
+int m_gpuVisibleInstances = 0;
 
 UINT m_width = 1280;
 UINT m_height = 720;
@@ -89,16 +104,20 @@ struct InstanceData {
     XMFLOAT4 params;
 };
 
-struct VisibilityBuffer {
-    XMUINT4 visibleIds[100];
-};
-
 struct AABB {
     XMFLOAT3 minExtents;
     XMFLOAT3 maxExtents;
 };
 
 struct Plane { XMFLOAT4 p; };
+
+struct CullParamsData {
+    XMUINT4 numShapes;
+    XMFLOAT4 frustum[6];
+    XMFLOAT4 bbMin[100];
+    XMFLOAT4 bbMax[100];
+};
+
 
 std::vector<InstanceData> g_Instances;
 std::vector<AABB> g_InstanceAABBs;
@@ -164,7 +183,7 @@ HRESULT CreateTextureArraySRV(ID3D11Device* device, const std::vector<TextureDes
     texDesc.Width = descs[0].width;
     texDesc.Height = descs[0].height;
     texDesc.MipLevels = descs[0].mipmapsCount;
-    texDesc.ArraySize = isCubemap ? 6 : descs.size();
+    texDesc.ArraySize = isCubemap ? 6 : (UINT)descs.size();
     texDesc.Format = descs[0].fmt;
     texDesc.SampleDesc.Count = 1;
     texDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -172,18 +191,11 @@ HRESULT CreateTextureArraySRV(ID3D11Device* device, const std::vector<TextureDes
     texDesc.MiscFlags = isCubemap ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
 
     std::vector<D3D11_SUBRESOURCE_DATA> initData(texDesc.ArraySize * texDesc.MipLevels);
-
     size_t cubemapOffset = 0;
 
     for (UINT arraySlice = 0; arraySlice < texDesc.ArraySize; ++arraySlice) {
         size_t offset = isCubemap ? cubemapOffset : 0;
-
         const TextureDesc& currentDesc = isCubemap ? descs[0] : descs[arraySlice];
-
-        if (!isCubemap && (currentDesc.fmt != texDesc.Format || currentDesc.mipmapsCount != texDesc.MipLevels)) {
-            OutputDebugStringA("Error: Texture array elements must have identical formats and mipmap counts.\n");
-            return E_FAIL;
-        }
 
         for (UINT mip = 0; mip < texDesc.MipLevels; ++mip) {
             UINT mipWidth = std::max(1u, currentDesc.width >> mip);
@@ -206,13 +218,9 @@ HRESULT CreateTextureArraySRV(ID3D11Device* device, const std::vector<TextureDes
             UINT index = arraySlice * texDesc.MipLevels + mip;
             initData[index].pSysMem = static_cast<const char*>(currentDesc.pData) + offset;
             initData[index].SysMemPitch = mipPitch;
-
             offset += static_cast<size_t>(mipPitch) * mipLines;
         }
-
-        if (isCubemap) {
-            cubemapOffset = offset;
-        }
+        if (isCubemap) cubemapOffset = offset;
     }
 
     ID3D11Texture2D* pTexture = nullptr;
@@ -250,13 +258,12 @@ struct InstanceData {
 };
 
 cbuffer InstanceBuffer : register(b1) { InstanceData instances[100]; };
-cbuffer VisibilityBuffer : register(b2) { uint4 visibleIds[100]; };
+StructuredBuffer<uint4> visibleIds : register(t3); // Изменено на StructuredBuffer
 
 Texture2DArray colorTextureArray : register(t0);
 Texture2DArray normalMapTextureArray : register(t1);
 TextureCube skyboxTexture : register(t2); 
 SamplerState colorSampler : register(s0);
-
 
 struct VSCubeInput {
     float3 pos : POSITION;
@@ -329,7 +336,6 @@ float4 ps_cube_inst(VSCubeOutput pixel) : SV_Target0 {
     return float4(finalColor, 1.0);
 }
 
-
 struct VSSkyboxInput { float3 pos : POSITION; };
 struct VSSkyboxOutput { float4 pos : SV_Position; float3 localPos : POSITION1; };
 
@@ -362,6 +368,45 @@ float4 ps_postprocess(VSPostOutput pixel) : SV_Target0 {
     float4 color = screenTexture.Sample(colorSampler, pixel.uv);
     float gray = dot(color.rgb, float3(0.299, 0.587, 0.114));
     return float4(gray, gray, gray, 1.0);
+}
+
+
+cbuffer CullParams : register(b1) {
+    uint4 numShapes; 
+    float4 frustum[6];
+    float4 bbMin[100];
+    float4 bbMax[100];
+};
+
+RWStructuredBuffer<uint> indirectArgs : register(u0);
+RWStructuredBuffer<uint4> objectIds : register(u1);
+
+[numthreads(64, 1, 1)]
+void cs_cull(uint3 globalThreadId : SV_DispatchThreadID) {
+    if (globalThreadId.x >= numShapes.x) {
+        return;
+    }
+    
+    bool inside = true;
+    for (int i = 0; i < 6; i++) {
+        float3 norm = frustum[i].xyz;
+        float3 p = float3(
+            norm.x < 0 ? bbMin[globalThreadId.x].x : bbMax[globalThreadId.x].x,
+            norm.y < 0 ? bbMin[globalThreadId.x].y : bbMax[globalThreadId.x].y,
+            norm.z < 0 ? bbMin[globalThreadId.x].z : bbMax[globalThreadId.x].z
+        );
+        float s = dot(float4(p, 1.0), frustum[i]);
+        if (s < 0.0f) {
+            inside = false;
+            break;
+        }
+    }
+    
+    if (inside) {
+        uint id = 0;
+        InterlockedAdd(indirectArgs[1], 1, id); // indirectArgs[1] - это InstanceCount
+        objectIds[id] = uint4(globalThreadId.x, 0, 0, 0);
+    }
 }
 )";
 
@@ -409,7 +454,6 @@ HRESULT CreateRenderTargets() {
     }
     return result;
 }
-
 
 void GenerateSphere(int latLines, int longLines, std::vector<SkyboxVertex>& vertices, std::vector<USHORT>& indices) {
     float phiStep = XM_PI / latLines;
@@ -469,7 +513,6 @@ std::wstring GetAssetPath(const std::wstring& filename) {
     return idePath + L"Assets\\" + filename;
 }
 
-
 void ExtractPlanes(XMMATRIX vp, Plane planes[6]) {
     XMFLOAT4X4 m; XMStoreFloat4x4(&m, vp);
     planes[0].p = XMFLOAT4(m._14 + m._11, m._24 + m._21, m._34 + m._31, m._44 + m._41);
@@ -484,21 +527,6 @@ void ExtractPlanes(XMMATRIX vp, Plane planes[6]) {
         planes[i].p.x /= length; planes[i].p.y /= length; planes[i].p.z /= length; planes[i].p.w /= length;
     }
 }
-
-bool IsBoxInside(const Plane planes[6], const AABB& box) {
-    for (int i = 0; i < 6; i++) {
-        XMFLOAT3 norm = { planes[i].p.x, planes[i].p.y, planes[i].p.z };
-        XMFLOAT3 p = {
-            std::signbit(norm.x) ? box.minExtents.x : box.maxExtents.x,
-            std::signbit(norm.y) ? box.minExtents.y : box.maxExtents.y,
-            std::signbit(norm.z) ? box.minExtents.z : box.maxExtents.z
-        };
-        float d = p.x * norm.x + p.y * norm.y + p.z * norm.z + planes[i].p.w;
-        if (d < 0.0f) return false;
-    }
-    return true;
-}
-
 
 HRESULT InitScene() {
     HRESULT hr = S_OK;
@@ -561,22 +589,54 @@ HRESULT InitScene() {
     D3D11_SUBRESOURCE_DATA ibDataSky = { sphereIndices.data(), 0, 0 };
     m_pDevice->CreateBuffer(&ibDescSky, &ibDataSky, &m_pSkyboxIB);
 
-
     D3D11_BUFFER_DESC sceneDesc = { sizeof(SceneBuffer), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
     m_pDevice->CreateBuffer(&sceneDesc, nullptr, &m_pSceneBuffer);
 
     D3D11_BUFFER_DESC instDesc = { sizeof(InstanceData) * 100, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
     m_pDevice->CreateBuffer(&instDesc, nullptr, &m_pInstanceBuffer);
 
-    D3D11_BUFFER_DESC visDesc = { sizeof(VisibilityBuffer), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
-    m_pDevice->CreateBuffer(&visDesc, nullptr, &m_pVisibilityBuffer);
 
+    D3D11_BUFFER_DESC cullParamsDesc = { sizeof(CullParamsData), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+    m_pDevice->CreateBuffer(&cullParamsDesc, nullptr, &m_pCullParams);
+
+    D3D11_BUFFER_DESC idargsSrcDesc = {};
+    idargsSrcDesc.ByteWidth = sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS);
+    idargsSrcDesc.Usage = D3D11_USAGE_DEFAULT;
+    idargsSrcDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    idargsSrcDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    idargsSrcDesc.StructureByteStride = sizeof(UINT);
+    m_pDevice->CreateBuffer(&idargsSrcDesc, nullptr, &m_pIndirectArgsSrc);
+    m_pDevice->CreateUnorderedAccessView(m_pIndirectArgsSrc, nullptr, &m_pIndirectArgsUAV);
+
+    D3D11_BUFFER_DESC idargsDesc = {};
+    idargsDesc.ByteWidth = sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS);
+    idargsDesc.Usage = D3D11_USAGE_DEFAULT;
+    idargsDesc.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+    m_pDevice->CreateBuffer(&idargsDesc, nullptr, &m_pIndirectArgs);
+
+    D3D11_BUFFER_DESC visDesc = {};
+    visDesc.ByteWidth = sizeof(XMUINT4) * 100;
+    visDesc.Usage = D3D11_USAGE_DEFAULT;
+    visDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    visDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    visDesc.StructureByteStride = sizeof(XMUINT4);
+    m_pDevice->CreateBuffer(&visDesc, nullptr, &m_pVisibilityBuffer);
+    m_pDevice->CreateUnorderedAccessView(m_pVisibilityBuffer, nullptr, &m_pVisibilityBufferUAV);
+    m_pDevice->CreateShaderResourceView(m_pVisibilityBuffer, nullptr, &m_pVisibilityBufferSRV);
+
+
+    D3D11_QUERY_DESC qdesc;
+    qdesc.Query = D3D11_QUERY_PIPELINE_STATISTICS;
+    qdesc.MiscFlags = 0;
+    for (int i = 0; i < 10; ++i) {
+        m_pDevice->CreateQuery(&qdesc, &m_queries[i]);
+    }
 
     UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
     flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
-    ID3DBlob* pVSBlob = nullptr; ID3DBlob* pPSBlob = nullptr; ID3DBlob* pErrorBlob = nullptr;
+    ID3DBlob* pVSBlob = nullptr; ID3DBlob* pPSBlob = nullptr; ID3DBlob* pCSBlob = nullptr; ID3DBlob* pErrorBlob = nullptr;
 
     D3DCompile(ShadersSource, strlen(ShadersSource), nullptr, nullptr, nullptr, "vs_cube_inst", "vs_5_0", flags, 0, &pVSBlob, &pErrorBlob);
     m_pDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pCubeVS);
@@ -611,6 +671,10 @@ HRESULT InitScene() {
     m_pDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pPostPS);
     SAFE_RELEASE(pPSBlob);
 
+    D3DCompile(ShadersSource, strlen(ShadersSource), nullptr, nullptr, nullptr, "cs_cull", "cs_5_0", flags, 0, &pCSBlob, &pErrorBlob);
+    m_pDevice->CreateComputeShader(pCSBlob->GetBufferPointer(), pCSBlob->GetBufferSize(), nullptr, &m_pCullShader);
+    SAFE_RELEASE(pCSBlob);
+
     D3D11_SAMPLER_DESC sampDesc = {};
     sampDesc.Filter = D3D11_FILTER_ANISOTROPIC; sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
     sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP; sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
@@ -625,13 +689,9 @@ HRESULT InitScene() {
     std::wstring path1 = GetAssetPath(L"vect.dds");
     std::wstring path2 = GetAssetPath(L"Brick.dds");
 
-
     if (LoadDDS(path1.c_str(), tex1, false) && LoadDDS(path2.c_str(), tex2, false)) {
-
-
         std::vector<TextureDesc> texArray = { tex1, tex2 };
         CreateTextureArraySRV(m_pDevice, texArray, false, &m_pTextureArrayView);
-
         delete[] static_cast<char*>(tex1.pData);
         delete[] static_cast<char*>(tex2.pData);
     }
@@ -641,10 +701,8 @@ HRESULT InitScene() {
     std::wstring normPath2 = GetAssetPath(L"BrickNM.dds");
 
     if (LoadDDS(normPath1.c_str(), norm1, false) && LoadDDS(normPath2.c_str(), norm2, false)) {
-
         std::vector<TextureDesc> normalArray = { norm1, norm2 };
         CreateTextureArraySRV(m_pDevice, normalArray, false, &m_pNormalMapTextureView);
-
         delete[] static_cast<char*>(norm1.pData);
         delete[] static_cast<char*>(norm2.pData);
     }
@@ -656,7 +714,6 @@ HRESULT InitScene() {
         CreateTextureArraySRV(m_pDevice, skyArray, true, &m_pSkyboxView);
         delete[] static_cast<char*>(skyboxDesc.pData);
     }
-
 
     for (int i = 0; i < 10; ++i) {
         for (int j = 0; j < 10; ++j) {
@@ -680,6 +737,7 @@ HRESULT InitScene() {
 }
 
 HRESULT InitDirectX(HWND hWnd) {
+    g_hWnd = hWnd;
     HRESULT result;
     IDXGIFactory* pFactory = nullptr; CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory);
     IDXGIAdapter* pSelectedAdapter = nullptr; IDXGIAdapter* pAdapter = nullptr; UINT adapterIdx = 0;
@@ -741,7 +799,6 @@ void Render() {
     XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PI / 3.0f, (float)m_width / (float)m_height, 100.0f, 0.1f);
     XMMATRIX vp = XMMatrixMultiply(view, proj);
 
-
     D3D11_MAPPED_SUBRESOURCE subresource;
     if (SUCCEEDED(m_pDeviceContext->Map(m_pSceneBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &subresource))) {
         SceneBuffer* pSceneBuffer = reinterpret_cast<SceneBuffer*>(subresource.pData);
@@ -753,21 +810,43 @@ void Render() {
     }
 
     Plane frustumPlanes[6]; ExtractPlanes(vp, frustumPlanes);
-    VisibilityBuffer visBuffer; UINT visibleCount = 0;
 
-    for (size_t i = 0; i < g_Instances.size(); ++i) {
-        if (IsBoxInside(frustumPlanes, g_InstanceAABBs[i])) {
-            visBuffer.visibleIds[visibleCount].x = (UINT)i;
-            visibleCount++;
+    if (SUCCEEDED(m_pDeviceContext->Map(m_pCullParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &subresource))) {
+        CullParamsData* cData = reinterpret_cast<CullParamsData*>(subresource.pData);
+        cData->numShapes = XMUINT4((UINT)g_Instances.size(), 0, 0, 0);
+        for (int i = 0; i < 6; ++i) cData->frustum[i] = frustumPlanes[i].p;
+        for (size_t i = 0; i < g_Instances.size(); ++i) {
+            cData->bbMin[i] = XMFLOAT4(g_InstanceAABBs[i].minExtents.x, g_InstanceAABBs[i].minExtents.y, g_InstanceAABBs[i].minExtents.z, 1.0f);
+            cData->bbMax[i] = XMFLOAT4(g_InstanceAABBs[i].maxExtents.x, g_InstanceAABBs[i].maxExtents.y, g_InstanceAABBs[i].maxExtents.z, 1.0f);
         }
+        m_pDeviceContext->Unmap(m_pCullParams, 0);
     }
-    m_pDeviceContext->UpdateSubresource(m_pVisibilityBuffer, 0, nullptr, &visBuffer, 0, 0);
+
+    D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS args = {};
+    args.IndexCountPerInstance = 36;
+    args.InstanceCount = 0;
+    args.StartIndexLocation = 0;
+    args.BaseVertexLocation = 0;
+    args.StartInstanceLocation = 0;
+    m_pDeviceContext->UpdateSubresource(m_pIndirectArgsSrc, 0, nullptr, &args, 0, 0);
+
+    ID3D11Buffer* csConsts[] = { m_pSceneBuffer, m_pCullParams };
+    m_pDeviceContext->CSSetConstantBuffers(0, 2, csConsts);
+    ID3D11UnorderedAccessView* csUAVs[] = { m_pIndirectArgsUAV, m_pVisibilityBufferUAV };
+    m_pDeviceContext->CSSetUnorderedAccessViews(0, 2, csUAVs, nullptr);
+    m_pDeviceContext->CSSetShader(m_pCullShader, nullptr, 0);
+    UINT groupNumber = ((UINT)g_Instances.size() + 63) / 64;
+    m_pDeviceContext->Dispatch(groupNumber, 1, 1);
+
+    ID3D11UnorderedAccessView* nullUAVs[] = { nullptr, nullptr };
+    m_pDeviceContext->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+
+    m_pDeviceContext->CopyResource(m_pIndirectArgs, m_pIndirectArgsSrc);
 
     D3D11_VIEWPORT viewport = { 0.0f, 0.0f, (FLOAT)m_width, (FLOAT)m_height, 0.0f, 1.0f };
     m_pDeviceContext->RSSetViewports(1, &viewport);
     ID3D11SamplerState* samplers[] = { m_pSampler };
     m_pDeviceContext->PSSetSamplers(0, 1, samplers);
-
 
     ID3D11RenderTargetView* sceneViews[] = { m_pColorTargetRTV };
     m_pDeviceContext->OMSetRenderTargets(1, sceneViews, m_pDepthStencilView);
@@ -775,10 +854,9 @@ void Render() {
     m_pDeviceContext->ClearRenderTargetView(m_pColorTargetRTV, BackColor);
     m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 0.0f, 0);
 
-    ID3D11Buffer* constBuffers[] = { m_pSceneBuffer, m_pInstanceBuffer, m_pVisibilityBuffer };
-    m_pDeviceContext->VSSetConstantBuffers(0, 3, constBuffers);
-    m_pDeviceContext->PSSetConstantBuffers(0, 3, constBuffers);
-
+    ID3D11Buffer* constBuffers[] = { m_pSceneBuffer, m_pInstanceBuffer };
+    m_pDeviceContext->VSSetConstantBuffers(0, 2, constBuffers);
+    m_pDeviceContext->PSSetConstantBuffers(0, 2, constBuffers);
 
     m_pDeviceContext->OMSetDepthStencilState(m_pDepthStateOpaque, 0);
     m_pDeviceContext->VSSetShader(m_pCubeVS, nullptr, 0);
@@ -791,7 +869,32 @@ void Render() {
 
     ID3D11ShaderResourceView* cubeRes[] = { m_pTextureArrayView, m_pNormalMapTextureView };
     m_pDeviceContext->PSSetShaderResources(0, 2, cubeRes);
-    if (visibleCount > 0) m_pDeviceContext->DrawIndexedInstanced(36, visibleCount, 0, 0, 0);
+
+    m_pDeviceContext->VSSetShaderResources(3, 1, &m_pVisibilityBufferSRV);
+
+    m_pDeviceContext->Begin(m_queries[m_curFrame % 10]);
+    m_pDeviceContext->DrawIndexedInstancedIndirect(m_pIndirectArgs, 0);
+    m_pDeviceContext->End(m_queries[m_curFrame % 10]);
+    m_curFrame++;
+
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
+    while (m_lastCompletedFrame < m_curFrame) {
+        HRESULT res = m_pDeviceContext->GetData(m_queries[m_lastCompletedFrame % 10], &stats, sizeof(D3D11_QUERY_DATA_PIPELINE_STATISTICS), 0);
+        if (res == S_OK) {
+            m_gpuVisibleInstances = (int)stats.IAPrimitives / 12;
+            m_lastCompletedFrame++;
+        }
+        else break;
+    }
+
+    if (g_hWnd) {
+        wchar_t title[256];
+        swprintf_s(title, L"DX11Lesson | Rendered Instances (GPU Culling): %d", m_gpuVisibleInstances);
+        SetWindowText(g_hWnd, title);
+    }
+
+    ID3D11ShaderResourceView* nullSRV[] = { nullptr };
+    m_pDeviceContext->VSSetShaderResources(3, 1, nullSRV);
 
     m_pDeviceContext->OMSetDepthStencilState(m_pDepthStateSkybox, 0);
     m_pDeviceContext->RSSetState(m_pRasterizerStateSkybox);
@@ -805,20 +908,16 @@ void Render() {
     m_pDeviceContext->IASetInputLayout(m_pSkyboxLayout);
     m_pDeviceContext->DrawIndexed(m_skyboxIndexCount, 0, 0);
 
-
     ID3D11ShaderResourceView* unbindSRV[] = { nullptr, nullptr, nullptr };
     m_pDeviceContext->PSSetShaderResources(0, 3, unbindSRV);
 
     ID3D11RenderTargetView* postViews[] = { m_pBackBufferRTV };
     m_pDeviceContext->OMSetRenderTargets(1, postViews, nullptr);
-
     m_pDeviceContext->RSSetState(nullptr);
     m_pDeviceContext->VSSetShader(m_pPostVS, nullptr, 0);
     m_pDeviceContext->PSSetShader(m_pPostPS, nullptr, 0);
-
     ID3D11ShaderResourceView* postRes[] = { m_pColorTargetSRV };
     m_pDeviceContext->PSSetShaderResources(0, 1, postRes);
-
     m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_pDeviceContext->IASetInputLayout(nullptr);
     m_pDeviceContext->Draw(3, 0);
@@ -829,6 +928,10 @@ void Render() {
 
 void Cleanup() {
     if (m_pDeviceContext) m_pDeviceContext->ClearState();
+    SAFE_RELEASE(m_pCullShader); SAFE_RELEASE(m_pCullParams);
+    SAFE_RELEASE(m_pIndirectArgsSrc); SAFE_RELEASE(m_pIndirectArgsUAV); SAFE_RELEASE(m_pIndirectArgs);
+    SAFE_RELEASE(m_pVisibilityBufferUAV); SAFE_RELEASE(m_pVisibilityBufferSRV);
+    for (int i = 0; i < 10; ++i) SAFE_RELEASE(m_queries[i]);
     SAFE_RELEASE(m_pPostVS); SAFE_RELEASE(m_pPostPS);
     SAFE_RELEASE(m_pColorTargetSRV); SAFE_RELEASE(m_pColorTargetRTV); SAFE_RELEASE(m_pColorTargetTexture);
     SAFE_RELEASE(m_pInstanceBuffer); SAFE_RELEASE(m_pVisibilityBuffer);
